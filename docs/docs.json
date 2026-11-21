@@ -420,7 +420,8 @@
                       },
                       "typescript/client/authentication",
                       "typescript/client/usemcp",
-                      "typescript/client/code-mode"
+                      "typescript/client/code-mode",
+                      "typescript/client/custom-code-executor"
                     ]
                   },
                   {

@@ -41,6 +41,8 @@ Run the complete matrix:
   and prompt completion in v2.
 - `node/communication/capabilities-client.ts` — client capability advertisement,
   MCP Apps tool metadata, and structured content in both eras.
+- `node/code-mode-custom-executor.ts` — a custom `BaseCodeExecutor` that runs
+  code mode in a child process and bridges tool calls back to the host.
 - `node/auth/oauth-flow.ts` — self-contained OAuth discovery, DCR, PKCE loopback,
   code exchange, and token persistence.
 - `browser/basic-http.ts` — browser entry smoke under `tsx`.
