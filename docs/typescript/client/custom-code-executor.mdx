@@ -1,0 +1,323 @@
+---
+title: "Custom Code Executors"
+description: "Run code mode in your own runtime or remote sandbox"
+icon: "box"
+---
+
+[Code mode](/typescript/client/code-mode) ships with two executors: `"vm"` (local
+Node.js VM) and `"e2b"` (E2B cloud sandbox). To run agent code anywhere else,
+such as another sandbox provider, a container, or a child process, pass your
+own executor to `codeMode.executor`. You don't need any changes to
+`@mcp-use/client`.
+
+`CodeModeConfig.executor` accepts three kinds of value:
+
+```typescript
+executor?: CodeExecutorType | CodeExecutorFunction | BaseCodeExecutor;
+```
+
+- `CodeExecutorType` is `"vm"` or `"e2b"`.
+- `CodeExecutorFunction` is a plain `(code, timeout?) => Promise<ExecutionResult>` function.
+- `BaseCodeExecutor` is an exported abstract class you can subclass.
+
+## Function or subclass?
+
+| Use a function when…                                | Subclass `BaseCodeExecutor` when…                                |
+| --------------------------------------------------- | ---------------------------------------------------------------- |
+| You wrap a runtime you already manage elsewhere     | The executor owns a resource (sandbox, process, VM) it must free |
+| You need no cleanup on `client.close()`             | You want `client.close()` to release that resource               |
+| You don't need the base class's server/tool helpers | You want `ensureServersConnected()` and `getToolNamespaces()`    |
+
+A function is wrapped in an internal adapter whose `cleanup()` does nothing.
+The client calls it with the `MCPClient` as `this` (see
+[Executors](/typescript/client/code-mode#executors)). Everything below covers
+the subclass path, which most remote sandbox integrations need.
+
+## The contract
+
+Shape of `BaseCodeExecutor` (simplified from `src/code-mode/executor.ts`):
+
+```typescript
+abstract class BaseCodeExecutor {
+  protected client: MCPClient;
+  constructor(client: MCPClient);
+
+  abstract execute(code: string, timeout?: number): Promise<ExecutionResult>;
+  abstract cleanup(): Promise<void>;
+
+  protected ensureServersConnected(): Promise<void>;
+  protected getToolNamespaces(): {
+    serverName: string;
+    tools: Tool[];
+    session: MCPSession;
+  }[];
+  public createSearchToolsFunction(): (
+    query?: string,
+    detailLevel?: "names" | "descriptions" | "full",
+  ) => Promise<ToolSearchResponse>;
+}
+```
+
+| Member                        | What it does                                                                                                                                                                      |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `execute(code, timeout?)`     | **Required.** Runs `code` and resolves an `ExecutionResult`. `timeout` is in milliseconds and comes straight from `client.executeCode(code, timeout)` or the `execute_code` tool. |
+| `cleanup()`                   | **Required.** Frees everything the executor created. `client.close()` calls it before closing MCP sessions.                                                                       |
+| `client`                      | The `MCPClient` whose sessions your executor uses.                                                                                                                                |
+| `ensureServersConnected()`    | Connects any configured server that has no active session yet. Call it at the start of `execute`.                                                                                 |
+| `getToolNamespaces()`         | Lists `{ serverName, tools, session }` for each active server, skipping the internal `code_mode` server. Use it to build the tool catalog your sandbox exposes.                   |
+| `createSearchToolsFunction()` | Returns the same function behind `client.searchTools()`. Bridge it to provide `search_tools` inside your sandbox.                                                                 |
+
+### `ExecutionResult`
+
+```typescript
+interface ExecutionResult {
+  result: unknown; // value the code returned (JSON-serializable for remote sandboxes)
+  logs: string[]; // captured console output
+  error: string | null; // null on success; a message on failure
+  execution_time: number; // seconds
+}
+```
+
+Report failures in your code, tool errors, and timeouts through `error`
+instead of throwing. The built-in executors do the same, and they use the
+message `"Script execution timed out"` when a timeout fires.
+
+<Note>
+  `ExecutionResult` is not re-exported from the package root. Derive it from the
+  exported `CodeExecutorFunction` type:
+
+```typescript
+import type { CodeExecutorFunction } from "@mcp-use/client";
+type ExecutionResult = Awaited<ReturnType<CodeExecutorFunction>>;
+```
+
+</Note>
+
+## Wiring the executor to its client
+
+The executor reads tools and sessions from `this.client`, so it must be bound
+to the **same** `MCPClient` you pass it to. The client is constructed with the
+executor in its options, so create the executor first and attach the client
+afterwards. Nothing runs until the first `executeCode()` call:
+
+```typescript
+class MyExecutor extends BaseCodeExecutor {
+  constructor(client?: MCPClient) {
+    super(client as MCPClient);
+  }
+
+  attach(client: MCPClient): this {
+    this.client = client;
+    return this;
+  }
+  // execute() and cleanup() …
+}
+
+const executor = new MyExecutor();
+const client = new MCPClient(config, { codeMode: { enabled: true, executor } });
+executor.attach(client);
+```
+
+If you instead write `new MyExecutor(otherClient)`, the executor connects
+servers and calls tools on `otherClient`, and `client.close()` won't close
+those sessions.
+
+## Bridging tool calls back to the host
+
+Code running in a remote sandbox can't reach the host's MCP sessions directly.
+The E2B executor (`executor-e2b.ts`) solves this with a bridge, and any remote
+executor can follow the same steps:
+
+1. **Shim.** Before the agent's code, inject a script that defines one global
+   object per server (for example `github.create_issue(args)`). Each method
+   sends a `{ id, server, tool, args }` request out of the sandbox and waits for
+   the matching response. Build the catalog from `getToolNamespaces()`, and
+   serialize names with `JSON.stringify` so any server or tool name produces
+   valid code. E2B also exposes each server under a sanitized identifier
+   (`name.replace(/[^a-zA-Z0-9_]/g, "_")`).
+2. **Transport out.** E2B prints a JSON line tagged `__MCP_TOOL_CALL__` to
+   stdout and watches it with `onStdout`. Use whatever your sandbox offers:
+   stdout, a websocket, IPC, or an HTTP callback.
+3. **Run on the host.** Look up the session and call the tool:
+
+   ```typescript
+   const session = this.client.getAllActiveSessions()[call.server];
+   if (!session) throw new Error(`Server ${call.server} not found`);
+   const toolResult = await session.callTool(call.tool, call.args);
+   ```
+
+   The built-in executors give sandbox code the parsed first content item:
+   `JSON.parse(text)` if the first item is text that parses as JSON, the raw text
+   otherwise, and the item itself for non-text content.
+
+4. **Transport back.** Send `{ data }` or `{ error }` to the sandbox. E2B writes
+   `/tmp/mcp_result_<id>.json` with `sandbox.files.write`, and the shim polls for
+   that file. The shim throws on `error` so the agent's code can catch it.
+5. **Return value.** Wrap the agent's code in an `async` function, then send its
+   return value back as JSON. E2B prints it between `__MCP_RESULT_START__` and
+   `__MCP_RESULT_END__` markers. Strip bridge traffic from the logs you return.
+
+## Lazy creation, timeouts and cleanup
+
+- **Create the sandbox lazily.** Start it on the first `execute`, not in the
+  constructor. Clients that enable code mode but never run code then cost
+  nothing. Cache the instance and reuse it for later calls.
+- **Enforce `timeout`.** Pass it to the vendor's command or run timeout, or race
+  it yourself and kill the run. Return `error: "Script execution timed out"`.
+  Keep a separate, longer sandbox lifetime (E2B's `timeoutMs` option) for the
+  sandbox itself.
+- **Free everything in `cleanup()`.** Kill the sandbox, reset your cached
+  reference so a later `execute` can start a new one, and log failures instead
+  of throwing. Tell users to call `await client.close()`, especially for paid
+  sandboxes.
+
+## Loading the vendor SDK as an optional dependency
+
+When you publish an executor as a package, load the vendor SDK with a dynamic
+`import()` inside the executor. Users who never select it then don't have to
+install it. Declare the SDK as an optional peer dependency. `E2BCodeExecutor`
+does this for `@e2b/code-interpreter` and fails with an install hint when the
+package is missing.
+
+## Remote sandbox skeleton
+
+The skeleton below shows the full shape. `@acme/sandbox` and its `Sandbox.create`, `files.write`,
+`run` and `kill` calls are **placeholders**: replace them with your vendor's
+SDK. `buildShim` and `parseOutput` stand in for steps 1 and 5 above.
+
+```typescript
+import {
+  BaseCodeExecutor,
+  MCPClient,
+  type CodeExecutorFunction,
+} from "@mcp-use/client";
+
+type ExecutionResult = Awaited<ReturnType<CodeExecutorFunction>>;
+
+export interface AcmeExecutorOptions {
+  apiKey: string;
+  /** Sandbox lifetime in ms (separate from per-run timeouts). */
+  sandboxTimeoutMs?: number;
+}
+
+export class AcmeCodeExecutor extends BaseCodeExecutor {
+  private sandbox: any = null;
+  private SandboxClass: any = null;
+
+  constructor(
+    private options: AcmeExecutorOptions,
+    client?: MCPClient,
+  ) {
+    super(client as MCPClient);
+  }
+
+  attach(client: MCPClient): this {
+    this.client = client;
+    return this;
+  }
+
+  private async getSandbox() {
+    if (this.sandbox) return this.sandbox;
+    if (!this.SandboxClass) {
+      try {
+        // Optional peer dependency: only loaded when this executor runs.
+        this.SandboxClass = (await import("@acme/sandbox")).Sandbox;
+      } catch {
+        throw new Error("Install @acme/sandbox to use AcmeCodeExecutor");
+      }
+    }
+    this.sandbox = await this.SandboxClass.create({
+      apiKey: this.options.apiKey,
+      timeoutMs: this.options.sandboxTimeoutMs ?? 300_000,
+    });
+    return this.sandbox;
+  }
+
+  async execute(code: string, timeout = 30_000): Promise<ExecutionResult> {
+    const start = Date.now();
+    try {
+      await this.ensureServersConnected();
+      const sandbox = await this.getSandbox();
+
+      const catalog = Object.fromEntries(
+        this.getToolNamespaces().map(({ serverName, tools }) => [
+          serverName,
+          tools.map((t) => t.name),
+        ]),
+      );
+      await sandbox.files.write("/tmp/run.js", buildShim(catalog) + wrap(code));
+
+      const run = await sandbox.run("node /tmp/run.js", {
+        timeoutMs: timeout,
+        onToolCall: async (call: {
+          id: string;
+          server: string;
+          tool: string;
+          args: any;
+        }) => {
+          try {
+            const session = this.client.getAllActiveSessions()[call.server];
+            if (!session) throw new Error(`Server ${call.server} not found`);
+            const res = await session.callTool(call.tool, call.args);
+            return { data: unwrap(res) };
+          } catch (e: any) {
+            return { error: e.message ?? String(e) };
+          }
+        },
+      });
+
+      const { result, logs, error } = parseOutput(run);
+      return {
+        result,
+        logs,
+        error,
+        execution_time: (Date.now() - start) / 1000,
+      };
+    } catch (e: any) {
+      const msg = String(e?.message ?? e);
+      return {
+        result: null,
+        logs: [],
+        error: /time(d)? ?out/i.test(msg) ? "Script execution timed out" : msg,
+        execution_time: (Date.now() - start) / 1000,
+      };
+    }
+  }
+
+  async cleanup(): Promise<void> {
+    if (!this.sandbox) return;
+    try {
+      await this.sandbox.kill();
+    } catch (e) {
+      console.error("Failed to stop Acme sandbox", e);
+    } finally {
+      this.sandbox = null;
+    }
+  }
+}
+
+// Usage
+const executor = new AcmeCodeExecutor({ apiKey: process.env.ACME_API_KEY! });
+const client = new MCPClient(config, { codeMode: { enabled: true, executor } });
+executor.attach(client);
+try {
+  console.log(await client.executeCode("return await github.list_issues({})"));
+} finally {
+  await client.close(); // calls executor.cleanup()
+}
+```
+
+## Runnable example
+
+[`examples/node/code-mode-custom-executor.ts`](https://github.com/mcp-use/mcp-use/blob/main/libraries/typescript/packages/client/examples/node/code-mode-custom-executor.ts)
+uses this pattern with no paid service. Each `executeCode()` runs in a Node.js
+child process, and tool calls and `search_tools` travel to the host over IPC.
+The example also shows a timeout and a tool error. A child process is not a
+security boundary, so use it to learn the pattern, not to isolate untrusted
+code.
+
+```bash
+cd libraries/typescript/packages/client
+pnpm build
+pnpm dlx tsx examples/node/code-mode-custom-executor.ts
+```
